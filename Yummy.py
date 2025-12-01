@@ -17,13 +17,13 @@ from diffusers import AutoPipelineForText2Image
 # --- PUSLAPIO KONFIGŪRACIJA ---
 st.set_page_config(page_title="MasterChef AI", layout="wide", page_icon="🍳")
 
-# --- MĖSŲ SĄRAŠAS (Konfliktų logikai) ---
+# --- MĖSŲ SĄRAŠAS ---
 PROTEINS = {
     'chicken', 'beef', 'pork', 'lamb', 'turkey', 'duck', 'veal', 
     'steak', 'bacon', 'ham', 'sausage', 'fish', 'shrimp', 'salmon', 'tuna', 'meat'
 }
 
-# --- DIETŲ TAISYKLĖS (Draudžiami produktai) ---
+# --- DIETŲ TAISYKLĖS ---
 DIETARY_RULES = {
     "Vegetarian": {'chicken', 'beef', 'pork', 'lamb', 'turkey', 'duck', 'veal', 'steak', 'bacon', 'ham', 'sausage', 'fish', 'shrimp', 'salmon', 'tuna', 'meat', 'lard'},
     "Vegan": {'chicken', 'beef', 'pork', 'lamb', 'turkey', 'duck', 'veal', 'steak', 'bacon', 'ham', 'sausage', 'fish', 'shrimp', 'salmon', 'tuna', 'meat', 'lard', 'egg', 'eggs', 'milk', 'cheese', 'butter', 'cream', 'yogurt', 'honey', 'mayonnaise', 'gelatin'},
@@ -102,7 +102,6 @@ def clean_display_text(raw_text):
     return [i.replace('"', '').replace("'", "").strip().replace(r"\u00b0", "°") for i in items]
 
 def process_nlp_input(raw_text):
-    # Išvalo ir lemmatizuoja tekstą
     clean_str = re.sub(r'[^a-zA-Z,\s]', '', raw_text).lower()
     items = [x.strip() for x in clean_str.split(',')]
     processed = set()
@@ -114,19 +113,15 @@ def process_nlp_input(raw_text):
     return list(processed)
 
 def get_recommendations(user_text, negative_text, diet_type, top_n=30):
-    # 1. Apdorojame teigiamus ingredientus
     processed_items = process_nlp_input(user_text)
-    
-    # 2. Apdorojame neigiamus ingredientus (Vengti)
     negative_items = set(process_nlp_input(negative_text))
     
-    # 3. Identifikuojame vartotojo mėsas (dėl bonusų sistemos)
     user_proteins = set()
     for item in processed_items:
         for word in item.split():
             if word in PROTEINS: user_proteins.add(word)
     
-    # 4. Vektorizavimas ir NN paieška
+    # NN Paieška
     user_matrix = mlb.transform([processed_items])
     user_tensor = torch.FloatTensor(user_matrix).to(device)
     
@@ -134,50 +129,41 @@ def get_recommendations(user_text, negative_text, diet_type, top_n=30):
         user_vec = model(user_tensor)
         user_norm = user_vec / user_vec.norm(p=2, dim=1, keepdim=True)
     
-    # Imame 500 kandidatų filtravimui
     scores = torch.mm(user_norm, db_embeddings.t()).squeeze()
     top_scores, top_indices = torch.topk(scores, 500) 
     
-    # --- FILTRAVIMAS IR PERRŪŠIAVIMAS ---
+    # Filtravimas
     results = df.iloc[top_indices.cpu().numpy()].copy()
     nn_scores = top_scores.cpu().numpy()
     
     final_scores = []
-    keep_indices = [] # Čia saugosime tik tuos, kurie praeina filtrus
+    keep_indices = []
     
-    # Pasiruošiame dietos "juodąjį sąrašą"
     diet_forbidden = DIETARY_RULES.get(diet_type, set())
     
     for idx, (row_idx, row) in enumerate(results.iterrows()):
         recipe_ing_str = " ".join(row['clean_list'])
         recipe_ing_set = set(row['clean_list'])
         
-        # --- 1. GRIEŽTI FILTRAI (Hard Filters) ---
         discard = False
         
-        # A. Vartotojo įvesti neigiami produktai
+        # Hard Filters
         for neg in negative_items:
-            # Tikriname ar neigiamas žodis yra recepte (dalinis atitikimas)
-            # Pvz. jei neg='nut', tai išmes 'peanut', 'walnut'
             if neg in recipe_ing_str: 
                 discard = True; break
         if discard: continue
             
-        # B. Dietos filtrai
         if diet_type != "Viskas":
             for forbidden in diet_forbidden:
-                # Tikriname atskirus žodžius
-                # split() svarbu, kad 'grape' neužblokuotų 'grapefruit'
                 recipe_words = set(recipe_ing_str.split())
                 if forbidden in recipe_words:
                     discard = True; break
         if discard: continue
         
-        # --- 2. BALŲ PERSKAIČIAVIMAS (Soft Logic) ---
+        # Scoring
         base_score = nn_scores[idx]
         penalty = 0.0
         
-        # Mėsos konfliktų logika
         recipe_proteins = set()
         for ing in row['clean_list']:
             for word in ing.split():
@@ -193,19 +179,15 @@ def get_recommendations(user_text, negative_text, diet_type, top_n=30):
         bonus = matches * 0.05
         
         final_scores.append(base_score - penalty + bonus)
-        keep_indices.append(idx) # Išsaugome indeksą (nuo 0 iki 499), kuris praėjo filtrą
+        keep_indices.append(idx)
 
-    # Sukuriame naują filtruotą DataFrame
-    # keep_indices nurodo eiles originaliame 500 kandidatų sąraše
     filtered_results = results.iloc[keep_indices].copy()
     filtered_results['match_score'] = final_scores
     
-    # Trūkstami ingredientai
     user_set = set(processed_items)
     filtered_results['missing_ingredients'] = filtered_results['clean_list'].apply(lambda x: set(x) - user_set)
     filtered_results['missing_count'] = filtered_results['missing_ingredients'].apply(len)
     
-    # Galutinis Rūšiavimas
     return filtered_results.sort_values(by='match_score', ascending=False).head(top_n), processed_items
 
 # --- VARTOTOJO SĄSAJA (UI) ---
@@ -216,7 +198,7 @@ if 'generated_images' not in st.session_state:
 st.title("🍳 MasterChef AI Generatorius")
 st.markdown("Išmanioji receptų paieška su **Neuroniniu Tinklu**, **Dietų Filtrais** ir **SDXL-Turbo**.")
 
-# --- ŠONINIS MENIU ---
+# Šoninis meniu
 st.sidebar.header("🛒 Produktai")
 st.sidebar.caption("Ką turite šaldytuve?")
 user_text = st.sidebar.text_area("Teigiami (pvz. chicken, rice):", "chicken, rice, onion, garlic")
@@ -244,12 +226,10 @@ with st.sidebar:
 if st.sidebar.button("🚀 Ieškoti Receptų", type="primary"):
     st.session_state['generated_images'] = {}
     with st.spinner("Filtruojami ir ieškomi receptai..."):
-        # Kviečiame atnaujintą funkciją su dietomis
         results, recognized = get_recommendations(user_text, negative_text, selected_diet, top_n=num_results)
         st.session_state['results'] = results
         st.session_state['recognized'] = recognized
 
-# NN Debug Info
 if 'recognized' in st.session_state:
     st.sidebar.info(f"🔍 **NN mato:** {', '.join(st.session_state['recognized'])}")
 
@@ -258,7 +238,7 @@ if 'results' in st.session_state:
     results = st.session_state['results']
     
     if results.empty:
-        st.warning(f"Receptų nerasta. Galbūt dieta '{selected_diet}' atmetė visus rezultatus su šiais ingredientais?")
+        st.warning(f"Receptų nerasta. Galbūt dieta '{selected_diet}' atmetė visus rezultatus?")
     else:
         st.success(f"Rasta receptų: {len(results)}")
         
@@ -301,9 +281,9 @@ if 'results' in st.session_state:
                                     except Exception as e: st.error(str(e))
                             else: st.error("Modelis neužkrautas.")
 
-                # TEKSTAS
+                # TEKSTAS (Dabar tik 2 Tabai)
                 with txt_col:
-                    tabs = st.tabs(["🛒 Ingredientai", "📖 Gaminimas", "🔗 Nuoroda"])
+                    tabs = st.tabs(["🛒 Ingredientai", "📖 Gaminimas"])
                     
                     with tabs[0]:
                         st.write("**Jums trūksta:**")
@@ -318,9 +298,5 @@ if 'results' in st.session_state:
                     with tabs[1]:
                         steps = clean_display_text(row['directions'])
                         for i, s in enumerate(steps, 1): st.write(f"**{i}.** {s}")
-                        
-                    with tabs[2]:
-                        if str(row['link']).startswith("http"):
-                            st.markdown(f"🔗 **[Atidaryti originalų šaltinį]({row['link']})**")
-                        else: st.info("Nuorodos nėra.")
+            
             st.divider()
